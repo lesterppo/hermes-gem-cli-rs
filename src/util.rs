@@ -40,7 +40,7 @@ pub fn classify_error(msg: &str) -> &'static str {
 
 /// The VM's default NO_PROXY contains bracketed IPv6 entries (`[::1]`)
 /// that break HTTP clients at construction time. Drop any entry that
-/// contains a bracket before any reqwest client is built.
+/// contains a bracket before any HTTP client is built.
 pub fn sanitize_no_proxy() {
     for key in ["NO_PROXY", "no_proxy"] {
         if let Ok(v) = std::env::var(key) {

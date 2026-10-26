@@ -208,9 +208,15 @@ fn main() -> ExitCode {
     let home = home_dir();
     let raw = args.raw_mode;
 
+    let preferred_browser: Option<String> = args
+        .browser
+        .clone()
+        .or_else(|| std::env::var("GEMINI_BROWSER").ok().filter(|s| !s.is_empty()));
+    let preferred = preferred_browser.as_deref();
+
     // ── --init: validate + cache (same two fields as Python) ──
     if args.init {
-        match resolve_auth(&home, &base_url()) {
+        match resolve_auth(&home, &base_url(), preferred) {
             Ok(auth) => {
                 if let Err(e) = save_auth_cache(&home, &auth.sid, auth.ts.as_deref()) {
                     fail("AUTH_CACHE_FAILED", &e.to_string(), None);
@@ -222,18 +228,50 @@ fn main() -> ExitCode {
         }
     }
 
-    // ── --login needs a browser (this binary has none) ──
+    // ── --login: Python opens gemini.google.com and polls the browser
+    // cookie scan for 120s (3s cadence). Rust does the same: best-effort
+    // xdg-open, then poll Chromium/Firefox/Edge scans in preference
+    // order, saving the cache the moment a SID appears.
     if args.login {
-        fail(
-            "NOT_YET",
-            "Interactive browser login is not implemented in the Rust port. Sign in at gemini.google.com in a browser, then run gem-cli-rs --init (env GEMINI_SID/GEMINI_TS also work).",
-            None,
-        );
+        use gem_cli_rs::auth::scan_browsers;
+        let _ = std::process::Command::new("xdg-open")
+            .arg("https://gemini.google.com")
+            .spawn();
+        log(raw, "Opening gemini.google.com for login...");
+        let mut found = None;
+        for i in 0..40 {
+            if let Some((_, sid, ts, _)) = scan_browsers(&home, preferred) {
+                found = Some((sid, ts));
+                log(raw, &format!("Cookies acquired after ~{}s", (i + 1) * 3));
+                break;
+            }
+            if (i + 1) % 10 == 0 {
+                log(raw, &format!("Still waiting... ({}s)", (i + 1) * 3));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        match found {
+            Some((sid, ts)) => {
+                if let Err(e) = save_auth_cache(&home, &sid, ts.as_deref()) {
+                    fail("AUTH_CACHE_FAILED", &e.to_string(), None);
+                }
+                println!(
+                    "{}",
+                    json!({"ok": true, "action": "login", "cached": gem_cli_rs::auth::auth_cache_path(&home).display().to_string()})
+                );
+                return ExitCode::SUCCESS;
+            }
+            None => fail(
+                "LOGIN_FAILED",
+                "Login timed out. Try again or set GEMINI_SID/GEMINI_TS.",
+                None,
+            ),
+        }
     }
 
     // ── --doctor: existence/liveness only, never values ──
     if args.doctor {
-        let cands = doctor_candidates(&home, &base_url());
+        let cands = doctor_candidates(&home, &base_url(), preferred);
         let live = cands.iter().any(|c| c.live);
         let selected = cands.iter().find(|c| c.live).map(|c| c.source.clone());
         let sources: Vec<Value> = cands
@@ -270,21 +308,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // ── Uploads are not yet implemented (no content-push upload path) ──
-    if !args.images.is_empty() || !args.files.is_empty() {
-        fail(
-            "UPLOAD_NOT_YET",
-            "File/image upload (-f/-i) is not yet implemented in the Rust port (content-push upload path). Use the Python gem-cli for uploads, or chat with a text prompt.",
-            None,
-        );
-    }
-    if args.edit_gem_id.is_some() || args.delete_chat_id.is_some() {
-        fail(
-            "NOT_YET",
-            "--edit-gem / --delete-chat are not yet implemented in the Rust port (UPDATE_BOT_METADATA / DELETE_CONVERSATION payloads not verified against a live session).",
-            None,
-        );
-    }
+    // Uploads, --edit-gem and --delete-chat are handled below, after
+    // auth (edit/delete in the discovery section, uploads on the chat
+    // path, exactly where Python handles them).
 
     // ── Early validation, mirroring gem-cli.py: BAD_URL is reported before
     // any auth work on the chat/gem-info path, and a bare invocation (no
@@ -293,6 +319,8 @@ fn main() -> ExitCode {
         || args.list_gems
         || args.create_gem_name.is_some()
         || args.delete_gem_id.is_some()
+        || args.edit_gem_id.is_some()
+        || args.delete_chat_id.is_some()
         || args.list_chats
         || args.read_chat_id.is_some()
         || args.fetch_latest_id.is_some()
@@ -314,7 +342,7 @@ fn main() -> ExitCode {
     }
 
     // ── Auth for everything below ──
-    let auth = match resolve_auth(&home, &base_url()) {
+    let auth = match resolve_auth(&home, &base_url(), preferred) {
         Ok(a) => a,
         Err(e) => fail("AUTH_EXPIRED", &e, None),
     };
@@ -348,10 +376,27 @@ fn main() -> ExitCode {
     }
     if args.create_gem_name.is_some() {
         let name = args.create_gem_name.clone().unwrap();
-        let prompt = if !args.prompt.is_empty() {
+        // Python prompt sources, in order: -p (plus stdin appended),
+        // positional args, stdin alone; otherwise NO_PROMPT.
+        let prompt = if let Some(pf) = &args.prompt_flag {
+            let mut p = pf.clone();
+            if !atty_stdin() {
+                let stdin = read_stdin();
+                if !stdin.is_empty() {
+                    p = format!("{}\n\n{}", p, stdin);
+                }
+            }
+            p
+        } else if !args.prompt.is_empty() {
             args.prompt.join(" ")
+        } else if !atty_stdin() {
+            let s = read_stdin();
+            if s.is_empty() {
+                fail("NO_PROMPT", "Provide system prompt via -p, stdin, or positional args.", None);
+            }
+            s
         } else {
-            args.prompt_flag.clone().unwrap_or_default()
+            fail("NO_PROMPT", "Provide system prompt via -p, stdin, or positional args.", None);
         };
         match client.create_gem(&name, &format!("Hermes task-specific Gem: {}", name), &prompt) {
             Ok(id) => {
@@ -368,6 +413,52 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             Err(e) => fail("GEM_DELETE_FAILED", &e, None),
+        }
+    }
+    if let Some(id) = &args.edit_gem_id {
+        // --edit-gem ID with the new system prompt from -p, positional
+        // args, or stdin (same sources as --create-gem). Name and
+        // description are kept from the existing gem when found.
+        let prompt = if let Some(pf) = &args.prompt_flag {
+            let mut p = pf.clone();
+            if !atty_stdin() {
+                let stdin = read_stdin();
+                if !stdin.is_empty() {
+                    p = format!("{}\n\n{}", p, stdin);
+                }
+            }
+            p
+        } else if !args.prompt.is_empty() {
+            args.prompt.join(" ")
+        } else if !atty_stdin() {
+            let s = read_stdin();
+            if s.is_empty() {
+                fail("NO_PROMPT", "Provide new system prompt via -p, stdin, or positional args.", None);
+            }
+            s
+        } else {
+            fail("NO_PROMPT", "Provide new system prompt via -p, stdin, or positional args.", None);
+        };
+        let existing = client.gem_info(id).ok();
+        let (name, desc) = match &existing {
+            Some(g) if !g.name.is_empty() => (g.name.clone(), g.description.clone()),
+            _ => (id.clone(), String::new()),
+        };
+        match client.update_gem(id, &name, &desc, &prompt) {
+            Ok(()) => {
+                println!("{}", json!({"ok": true, "action": "edit-gem", "id": id, "name": name}));
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => fail("GEM_EDIT_FAILED", &e, None),
+        }
+    }
+    if let Some(cid) = &args.delete_chat_id {
+        match client.delete_chat(cid) {
+            Ok(()) => {
+                println!("{}", json!({"ok": true, "action": "delete-chat", "id": cid}));
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => fail("CHAT_DELETE_FAILED", &e, None),
         }
     }
     if args.list_chats {
@@ -534,21 +625,196 @@ fn main() -> ExitCode {
         .map(|t| matches!(t.to_lowercase().as_str(), "extended" | "advanced"))
         .unwrap_or(false);
 
+    // ── Model resolution (Python: -m alone resolves by name against
+    // the registry and fails on unknown names; -m + --thinking resolves
+    // through the tier enum and falls back to the default when the
+    // account does not offer that tier's model; --thinking alone does
+    // not select a model in Python, but Rust keeps its extended flag).
+    let mut model_number: Option<i64> = None;
+    let mut model_header: Option<String> = None;
+    if let Some(m) = &args.model {
+        if args.thinking.is_some() {
+            // Enum-tier path: try to find a registry model whose
+            // alias matches the shorthand (flash/pro/lite/thinking);
+            // unknown tiers fall back to the default, as Python's
+            // _resolve_enum_model does for ids the account lacks.
+            if let Ok(info) = client.resolve_model(m) {
+                model_number = Some(info.model_number);
+                model_header = Some(info.header_value());
+            }
+        } else {
+            match client.resolve_model(m) {
+                Ok(info) => {
+                    model_number = Some(info.model_number);
+                    model_header = Some(info.header_value());
+                }
+                Err(e) => fail("MODEL_NOT_FOUND", &e, None),
+            }
+        }
+    }
+
+    // ── Uploads (Python: -i/-f files are uploaded to content-push
+    // before generation; file_data = [[[url], filename], ...]).
+    let mut file_data: Option<Value> = None;
+    if !args.images.is_empty() || !args.files.is_empty() {
+        let mut data: Vec<Value> = Vec::new();
+        for p in args.images.iter().chain(args.files.iter()) {
+            if !Path::new(p).exists() {
+                fail("FILE_NOT_FOUND", &format!("File not found: {}", p), None);
+            }
+            match client.upload_file(p) {
+                Ok((url, name)) => data.push(json!([[url], name])),
+                Err(e) => fail("UPLOAD_FAILED", &e, None),
+            }
+        }
+        file_data = Some(Value::Array(data));
+    }
+
+    // ── Deep research (Python: plan turn -> confirm turn -> poll the
+    // conversation until the report lands; there is no task entity to
+    // poll, the report's arrival in the chat is the only signal).
+    if args.deep_research {
+        // Python: create_deep_research_plan / start_deep_research run
+        // WITHOUT a Gem (the CLI still validates the Gem URL as its
+        // entry point, but the plan/confirm chats are default-Gemini).
+        // Passing a storybook Gem into those chats made it refuse
+        // ("I'm a text AI, this is beyond my capability") instead of
+        // starting research — that was the bicycle-run failure.
+        let plan = match client.chat(
+            &prompt,
+            &metadata,
+            None,
+            args.temporary,
+            true,
+            extended,
+            model_number,
+            120,
+            file_data.clone(),
+            model_header.clone(),
+        ) {
+            Ok(r) => r,
+            Err(e) => fail(&classify_error(&e), &e, None),
+        };
+        let plan_title: String = plan.text.lines().next().unwrap_or("Research plan").chars().take(120).collect();
+        log(raw, &format!("Plan: {} — starting...", plan_title));
+        let plan_meta = plan.metadata.clone();
+        let plan_cid = plan.cid.clone();
+        let confirm = match client.chat(
+            "Proceed with this plan without any modifications.",
+            &plan_meta,
+            None,
+            args.temporary,
+            true,
+            extended,
+            model_number,
+            120,
+            None,
+            model_header.clone(),
+        ) {
+            Ok(r) => r,
+            Err(e) => fail(&classify_error(&e), &e, None),
+        };
+        log(raw, "Research in progress...");
+        let confirm_meta = confirm.metadata.clone();
+        let mut final_text: Option<String> = None;
+        let mut timed_out = false;
+        let start = std::time::Instant::now();
+        loop {
+            // Report document (Python gemini-webapi
+            // extract_deep_research_document): the finished report
+            // lives at candidate[30][0], NOT in the reply text, which
+            // is only a short "completed" notice. The old text-length
+            // poll could never fire — that was the bug.
+            if let Ok(Some((_title, content))) = client.read_deep_research_document(&plan_cid) {
+                final_text = Some(content);
+                break;
+            }
+            if start.elapsed().as_secs() >= actual_timeout {
+                timed_out = true;
+                log(raw, "Deep research timed out; the task keeps running server-side — re-read the chat later to collect the report.");
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(15));
+        }
+        let text = final_text.unwrap_or_else(|| confirm.text.clone());
+        if let Some(state) = &mut conv_state {
+            state["cid"] = json!(plan_cid);
+            state["metadata"] = confirm_meta;
+            let turns = state["turns"].as_u64().unwrap_or(0);
+            state["turns"] = json!(turns + 2);
+            if let Some(conv) = &args.conversation {
+                save_conv(conv, state);
+            }
+        }
+        let ext = if args.json_out { ".json" } else { ".md" };
+        let out_path = args
+            .output
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("gem-cli-rs-{}{}", chrono_stamp(), ext)));
+        if args.json_out {
+            let mut payload = json!({"ok": true, "text": text, "model": model_label});
+            if let Some(state) = &conv_state {
+                payload["conversation"] = state.clone();
+            }
+            let _ = fs::write(&out_path, serde_json::to_string_pretty(&payload).unwrap());
+        } else {
+            let _ = fs::write(&out_path, &text);
+        }
+        let size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        let mut pointer = json!({"ok": true, "f": short_path(&out_path), "s": size, "model": model_label, "gem": gem_id, "dr": true});
+        if timed_out {
+            pointer["dr_timeout"] = json!(true);
+        }
+        if let Some(state) = &conv_state {
+            pointer["c"] = state["cid"].clone();
+            pointer["t"] = state["turns"].clone();
+        }
+        println!("{}", pointer);
+        return ExitCode::SUCCESS;
+    }
+
     let mut last_err: Option<String> = None;
     for attempt in 0..max_attempts {
         if attempt > 0 {
             log(raw, &format!("Retry {}...", attempt + 1));
         }
-        match client.chat(
-            &prompt,
-            &metadata,
-            Some(&gem_id),
-            args.temporary,
-            args.deep_research,
-            extended,
-            None,
-            actual_timeout,
-        ) {
+        // --stream: live deltas to stdout as they arrive (flushed);
+        // otherwise the buffered chat path. Both return ChatResult.
+        let chat_result = if args.stream {
+            let mut out = std::io::stdout();
+            client.chat_stream(
+                &prompt,
+                &metadata,
+                Some(&gem_id),
+                args.temporary,
+                args.deep_research,
+                extended,
+                model_number,
+                actual_timeout,
+                file_data.clone(),
+                model_header.clone(),
+                &mut |delta| {
+                    use std::io::Write;
+                    let _ = out.write_all(delta.as_bytes());
+                    let _ = out.flush();
+                },
+            )
+        } else {
+            client.chat(
+                &prompt,
+                &metadata,
+                Some(&gem_id),
+                args.temporary,
+                args.deep_research,
+                extended,
+                model_number,
+                actual_timeout,
+                file_data.clone(),
+                model_header.clone(),
+            )
+        };
+        match chat_result {
             Ok(res) => {
                 let mut text = res.text.clone();
                 if args.show_thoughts && !res.thoughts.is_empty() {
@@ -658,9 +924,9 @@ fn main() -> ExitCode {
                     return ExitCode::SUCCESS;
                 }
                 if args.stream {
-                    // Buffered in v1 (blocking client reads the full
-                    // response); the text is still emitted here.
-                    println!("{}", text);
+                    // Deltas already printed live during the chat;
+                    // end the streamed line before the pointer.
+                    println!();
                 }
                 let size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
                 let mut pointer = json!({"ok": true, "f": short_path(&out_path), "s": size});
@@ -698,7 +964,7 @@ fn main() -> ExitCode {
                 let kind = classify_error(&e);
                 if kind == "AUTH_EXPIRED" && attempt + 1 < max_attempts {
                     log(raw, "Auth expired, re-resolving...");
-                    match resolve_auth(&home, &base_url()) {
+                    match resolve_auth(&home, &base_url(), preferred) {
                         Ok(a) => {
                             client = make_client(&a, args.timeout);
                             if client.init().is_ok() {
@@ -709,7 +975,10 @@ fn main() -> ExitCode {
                     }
                 }
                 if kind == "RATE_LIMIT" && attempt + 1 < max_attempts {
-                    log(raw, "Rate limited, retrying (no sleep in v1 fast path)...");
+                    // Python waits 30s on the first retry, 60s after.
+                    let wait = if attempt == 0 { 30 } else { 60 };
+                    log(raw, &format!("Rate limited, waiting {}s...", wait));
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
                     continue;
                 }
                 last_err = Some(e);
@@ -727,15 +996,13 @@ fn main() -> ExitCode {
 }
 
 fn atty_stdin() -> bool {
-    // Without a libc isatty binding, treat a non-piped stdin conservatively:
-    // if stdin has data available via a pipe it is read by callers only
-    // when this returns false. We approximate with a /dev/stdin metadata
-    // check: character devices are terminals, pipes/files are not.
-    use std::os::unix::fs::FileTypeExt;
-    match fs::metadata("/dev/stdin") {
-        Ok(m) => m.file_type().is_char_device(),
-        Err(_) => true,
-    }
+    // Python's sys.stdin.isatty(): true only for a real terminal.
+    // The old /dev/stdin metadata approximation was wrong — a pipe
+    // whose writer stays open (e.g. a driver inheriting stdin) is not
+    // a tty either, and read_stdin() then blocked forever on -p /
+    // --create-gem. IsTerminal is the accurate check.
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 fn read_stdin() -> String {
@@ -768,14 +1035,16 @@ fn download_media(client: &GeminiClient, url: &str, dir: &str, stem: &str) -> Re
     } else {
         "bin"
     };
-    let resp = client
-        .http
-        .get(url)
-        .header("User-Agent", gem_cli_rs::auth::BROWSER_UA)
-        .header("Cookie", client.auth.cookie_header())
-        .send()
-        .map_err(|e| e.to_string())?;
-    let bytes = resp.bytes().map_err(|e| e.to_string())?;
+    let bytes = client.http.get_bytes(
+        url,
+        &[
+            (
+                "User-Agent".to_string(),
+                gem_cli_rs::auth::BROWSER_UA.to_string(),
+            ),
+            ("Cookie".to_string(), client.auth.cookie_header()),
+        ],
+    )?;
     fs::write(format!("{}/{}.{}", dir, stem, ext), &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }

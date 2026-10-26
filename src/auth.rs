@@ -175,8 +175,15 @@ pub fn decrypt_chromium_value(blob: &[u8], profile_dir: &Path) -> Option<String>
     None
 }
 
-fn chromium_profiles(home: &Path) -> Vec<PathBuf> {
+fn chromium_bases(home: &Path, edge: bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    if edge {
+        let b = home.join(".config").join("microsoft-edge");
+        if b.is_dir() {
+            out.push(b);
+        }
+        return out;
+    }
     for base in [
         home.join(".gemini-cli").join("cr-profile"),
         home.join(".config").join("google-chrome"),
@@ -189,10 +196,10 @@ fn chromium_profiles(home: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Scan Chromium cookie stores. Returns (sid, ts, full jar) for the first
-/// profile whose .google.com jar decrypts to a SID, plus the jar size.
-pub fn scan_chromium(home: &Path) -> Option<(String, Option<String>, Vec<(String, String)>)> {
-    for profile in chromium_profiles(home) {
+/// Scan Chromium/Edge cookie stores. Returns (sid, ts, full jar) for the
+/// first profile whose .google.com jar decrypts to a SID.
+fn scan_chromium_bases(home: &Path, edge: bool) -> Option<(String, Option<String>, Vec<(String, String)>)> {
+    for profile in chromium_bases(home, edge) {
         let mut dbs: Vec<PathBuf> = Vec::new();
         let def = profile.join("Default").join("Cookies");
         if def.exists() {
@@ -255,6 +262,168 @@ pub fn scan_chromium(home: &Path) -> Option<(String, Option<String>, Vec<(String
     None
 }
 
+/// Scan Firefox cookie stores. Firefox on Linux stores cookies in
+/// plaintext sqlite (`moz_cookies`, no v10 encryption), so no key is
+/// needed. Safari has no Linux store and is skipped (Python's
+/// browser_cookie3 order is chrome, firefox, edge, safari).
+pub fn scan_firefox(home: &Path) -> Option<(String, Option<String>, Vec<(String, String)>)> {
+    let base = home.join(".mozilla").join("firefox");
+    let Ok(rd) = std::fs::read_dir(&base) else {
+        return None;
+    };
+    for e in rd.flatten() {
+        let db = e.path().join("cookies.sqlite");
+        if !db.exists() {
+            continue;
+        }
+        let uri = format!("file:{}?mode=ro", db.to_string_lossy());
+        let Ok(conn) = Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT name, value FROM moz_cookies WHERE host LIKE '%google.com'",
+        ) else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
+        let jar: Vec<(String, String)> = rows.flatten().collect();
+        let sid = jar
+            .iter()
+            .find(|(k, _)| k == "__Secure-1PSID")
+            .map(|(_, v)| v.clone());
+        if let Some(sid) = sid {
+            let ts = jar
+                .iter()
+                .find(|(k, _)| k == "__Secure-1PSIDTS")
+                .map(|(_, v)| v.clone());
+            return Some((sid, ts, jar));
+        }
+    }
+    None
+}
+
+/// Browser scan in Python's order (chrome, firefox, edge), with the
+/// preferred browser moved first when one is named. Returns
+/// (source, sid, ts, jar).
+pub fn scan_browsers(
+    home: &Path,
+    preferred: Option<&str>,
+) -> Option<(String, String, Option<String>, Vec<(String, String)>)> {
+    let mut order = vec!["chrome", "firefox", "edge"];
+    if let Some(p) = preferred {
+        let pl = p.to_lowercase();
+        let key = if pl.contains("firefox") {
+            "firefox"
+        } else if pl.contains("edge") {
+            "edge"
+        } else {
+            "chrome"
+        };
+        order.retain(|x| *x != key);
+        order.insert(0, key);
+    }
+    for src in order {
+        let found = match src {
+            "firefox" => scan_firefox(home),
+            "edge" => scan_chromium_bases(home, true),
+            _ => scan_chromium_bases(home, false),
+        };
+        if let Some((sid, ts, jar)) = found {
+            return Some((src.to_string(), sid, ts, jar));
+        }
+    }
+    None
+}
+
+/// Backwards-compatible Chromium-only scan (used by tests).
+pub fn scan_chromium(home: &Path) -> Option<(String, Option<String>, Vec<(String, String)>)> {
+    scan_chromium_bases(home, false)
+}
+
+/// CDP cookie tier (Python gemini.py `_cdp_cookies`): live cookies
+/// from an already-running CDP browser, no decryption, no browser
+/// launch. Endpoint: GEMINI_CDP_URL, GEM_PW_CDP, or
+/// http://127.0.0.1:9223, unless GEMINI_NO_CDP is set. Flow: GET
+/// /json/version for webSocketDebuggerUrl, then WebSocket
+/// Network.enable + Network.getAllCookies (8s total, matching the
+/// Playwright timeout). Returns None on any error, including "no
+/// CDP browser listening" (connection refused, instant).
+pub fn cdp_cookies() -> Option<(String, Option<String>)> {
+    if std::env::var("GEMINI_NO_CDP").is_ok() {
+        return None;
+    }
+    let base = std::env::var("GEMINI_CDP_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("GEM_PW_CDP").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "http://127.0.0.1:9223".to_string());
+    let base = base.trim_end_matches('/').to_string();
+    // /json/version via the leyline client (plain HTTP, no auth).
+    let http = match crate::client::build_client(8) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let (_, version_text) = http.get(&format!("{}/json/version", base), &[]).ok()?;
+    let ws_url = serde_json::from_str::<serde_json::Value>(&version_text)
+        .ok()?
+        .get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())?;
+    // WebSocket flow on a fresh runtime, bounded by an 8s timeout.
+    let rt = tokio::runtime::Runtime::new().ok()?;
+    rt.block_on(async {
+        let fut = async {
+            use futures_util::{SinkExt, StreamExt};
+            let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.ok()?;
+            let send = |id: u32, method: &str| {
+                serde_json::json!({"id": id, "method": method, "params": {}}).to_string()
+            };
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(send(1, "Network.enable").into()))
+                .await
+                .ok()?;
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(send(2, "Network.getAllCookies").into()))
+                .await
+                .ok()?;
+            while let Some(msg) = ws.next().await {
+                let text = match msg.ok()? {
+                    tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                    _ => continue,
+                };
+                let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+                if v.get("id").and_then(|i| i.as_u64()) != Some(2) {
+                    continue;
+                }
+                let cookies = v.get("result")?.get("cookies")?.as_array()?;
+                let mut sid = None;
+                let mut ts = None;
+                for c in cookies {
+                    let name = c.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let domain = c.get("domain").and_then(|d| d.as_str()).unwrap_or("");
+                    if !domain.contains("google.com") {
+                        continue;
+                    }
+                    let value = c.get("value").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                    if name == "__Secure-1PSID" {
+                        sid = Some(value);
+                    } else if name == "__Secure-1PSIDTS" {
+                        ts = Some(value);
+                    }
+                }
+                return sid.map(|s| (s, ts));
+            }
+            None
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(8), fut).await.ok().flatten()
+    })
+}
+
 /// Cheap real check (Python `_validate_auth`): does /app hand back a
 /// session token for this SID/TS pair? `base` is the Gemini origin
 /// (https://gemini.google.com, or a mock base in tests).
@@ -273,25 +442,24 @@ pub fn validate_auth(base: &str, sid: &str, ts: Option<&str>, jar: &[(String, St
         Err(_) => return false,
     };
     let url = format!("{}/app", base.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .header("User-Agent", BROWSER_UA)
-        .header("Cookie", auth.cookie_header())
-        .header("Accept-Language", "en")
-        .send();
-    match resp {
-        Ok(r) => r
-            .text()
-            .map(|t| t.contains("SNlM0e"))
-            .unwrap_or(false),
+    match client.get(
+        &url,
+        &[
+            ("User-Agent".to_string(), BROWSER_UA.to_string()),
+            ("Cookie".to_string(), auth.cookie_header()),
+            ("Accept-Language".to_string(), "en".to_string()),
+        ],
+    ) {
+        Ok((_, text)) => text.contains("SNlM0e"),
         Err(_) => false,
     }
 }
 
 /// Resolve auth, validating each candidate against /app. Returns the
 /// first live candidate, or an error naming the tiers that were tried
-/// (never any credential value).
-pub fn resolve_auth(home: &Path, base: &str) -> Result<Auth, String> {
+/// (never any credential value). `preferred` is the --browser /
+// GEMINI_BROWSER name, moved first in the browser scan order.
+pub fn resolve_auth(home: &Path, base: &str, preferred: Option<&str>) -> Result<Auth, String> {
     let mut tried: Vec<String> = Vec::new();
     if let (Ok(sid), ts) = (
         std::env::var("GEMINI_SID"),
@@ -320,14 +488,28 @@ pub fn resolve_auth(home: &Path, base: &str) -> Result<Auth, String> {
             });
         }
     }
-    if let Some((sid, ts, jar)) = scan_chromium(home) {
-        tried.push("chromium".to_string());
+    if let Some((src, sid, ts, jar)) = scan_browsers(home, preferred) {
+        tried.push(src.clone());
         if validate_auth(base, &sid, ts.as_deref(), &jar) {
             return Ok(Auth {
                 sid,
                 ts,
                 jar,
-                source: "chromium".to_string(),
+                source: src,
+            });
+        }
+    }
+    // CDP fallback (Python gemini.py ordering: local browsers first,
+    // CDP after — a CDP profile can hold a dead session, so it must
+    // never outrank a working local profile).
+    if let Some((sid, ts)) = cdp_cookies() {
+        tried.push("cdp".to_string());
+        if validate_auth(base, &sid, ts.as_deref(), &[]) {
+            return Ok(Auth {
+                sid,
+                ts,
+                jar: Vec::new(),
+                source: "cdp".to_string(),
             });
         }
     }
@@ -342,7 +524,7 @@ pub fn resolve_auth(home: &Path, base: &str) -> Result<Auth, String> {
 }
 
 /// Doctor-style candidate report: existence/liveness only, no values.
-pub fn doctor_candidates(home: &Path, base: &str) -> Vec<AuthCandidate> {
+pub fn doctor_candidates(home: &Path, base: &str, preferred: Option<&str>) -> Vec<AuthCandidate> {
     let mut out = Vec::new();
     if let Ok(sid) = std::env::var("GEMINI_SID") {
         if !sid.is_empty() {
@@ -365,12 +547,21 @@ pub fn doctor_candidates(home: &Path, base: &str) -> Vec<AuthCandidate> {
             live,
         });
     }
-    if let Some((sid, ts, jar)) = scan_chromium(home) {
+    if let Some((src, sid, ts, jar)) = scan_browsers(home, preferred) {
         let live = validate_auth(base, &sid, ts.as_deref(), &jar);
         out.push(AuthCandidate {
-            source: "chromium".to_string(),
+            source: src,
             has_ts: ts.is_some(),
             jar_cookies: Some(jar.len()),
+            live,
+        });
+    }
+    if let Some((sid, ts)) = cdp_cookies() {
+        let live = validate_auth(base, &sid, ts.as_deref(), &[]);
+        out.push(AuthCandidate {
+            source: "cdp".to_string(),
+            has_ts: ts.is_some(),
+            jar_cookies: None,
             live,
         });
     }
@@ -396,6 +587,46 @@ mod tests {
         assert!(h.contains("__Secure-1PSID=SID"));
         assert!(!h.contains("OLD"));
         assert!(h.contains("NID=nid"));
+    }
+
+    #[test]
+    fn cdp_disabled_by_env() {
+        // GEMINI_NO_CDP must short-circuit before any network attempt.
+        std::env::set_var("GEMINI_NO_CDP", "1");
+        let r = cdp_cookies();
+        std::env::remove_var("GEMINI_NO_CDP");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn firefox_scan_finds_sid() {
+        // Firefox cookies are plaintext sqlite; build a fake profile
+        // and check the scan picks up the SID/TS pair.
+        let dir = std::env::temp_dir().join(format!("gem-rs-ff-{}", std::process::id()));
+        let profile = dir.join(".mozilla").join("firefox").join("test.default");
+        std::fs::create_dir_all(&profile).unwrap();
+        let db = profile.join("cookies.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE moz_cookies (host TEXT, name TEXT, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO moz_cookies VALUES ('.google.com', '__Secure-1PSID', 'FFSID')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO moz_cookies VALUES ('.google.com', '__Secure-1PSIDTS', 'FFTS')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let found = scan_firefox(&dir).expect("firefox scan");
+        assert_eq!(found.0, "FFSID");
+        assert_eq!(found.1.as_deref(), Some("FFTS"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

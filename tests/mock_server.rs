@@ -39,9 +39,43 @@ fn start_mock() -> String {
     let addr = listener.local_addr().unwrap();
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut buf = [0u8; 65536];
-            let n = stream.read(&mut buf).unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            // Read the full request: headers + Content-Length body.
+            // A single read() is not enough — some transports send
+            // headers and body in separate packets, and routing on the
+            // body (rpcid) then sees an empty body and returns [].
+            let mut raw: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw);
+                        if let Some(pos) = text.find("\r\n\r\n") {
+                            let headers = &text[..pos];
+                            let body_len = headers
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse::<usize>().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= pos + 4 + body_len {
+                                break;
+                            }
+                        }
+                        if raw.len() > 1_000_000 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&raw).to_string();
             let first_line = req.lines().next().unwrap_or("").to_string();
             let body = if first_line.contains("GET /app") {
                 "{\"SNlM0e\":\"MOCKAT\",\"cfb2h\":\"MOCKBL\",\"FdrFJe\":\"MOCKSID\",\"TuX5cc\":\"en\",\"qKIAYe\":\"MOCKPUSH\"}".to_string()
@@ -56,8 +90,23 @@ fn start_mock() -> String {
                         serde_json::json!([null, null, [["gem1", ["Test Gem", "A test gem"]]]]),
                     )
                 } else if req.contains("otAQ7b") {
-                    let mut models = vec![serde_json::Value::Null; 16];
-                    models[15] = serde_json::json!([["gemini-3-flash"], ["gemini-3-pro"]]);
+                    // Realistic AvailableModel rows: [hex id, category,
+                    // description, ..., display at [11], model_number
+                    // at [17]] — category "Flash" -> name "gemini-flash".
+                    let mut flash = vec![serde_json::Value::Null; 18];
+                    flash[0] = serde_json::json!("fbb127bbb056c959");
+                    flash[1] = serde_json::json!("Flash");
+                    flash[2] = serde_json::json!("Fast model");
+                    flash[11] = serde_json::json!("Flash");
+                    flash[17] = serde_json::json!(1);
+                    let mut pro = vec![serde_json::Value::Null; 18];
+                    pro[0] = serde_json::json!("e6fa609c3fa255c0");
+                    pro[1] = serde_json::json!("Pro");
+                    pro[2] = serde_json::json!("Capable model");
+                    pro[11] = serde_json::json!("Pro");
+                    pro[17] = serde_json::json!(3);
+                    let mut models = vec![serde_json::Value::Null; 18];
+                    models[15] = serde_json::json!([flash, pro]);
                     batch_body("otAQ7b", serde_json::Value::Array(models))
                 } else if req.contains("MaZiqc") {
                     batch_body(
@@ -113,6 +162,8 @@ fn mock_end_to_end() {
             false,
             None,
             30,
+            None,
+            None,
         )
         .expect("mock chat");
     assert_eq!(res.text, "Hello from mock Gemini");
@@ -126,7 +177,13 @@ fn mock_end_to_end() {
     assert_eq!(gems[0].name, "Test Gem");
 
     let models = client.list_models().expect("mock models");
-    assert!(models.iter().any(|m| m.contains("gemini-3-flash")));
+    assert_eq!(models, vec!["gemini-flash", "gemini-pro"]);
+    let infos = client.list_model_infos().expect("mock model infos");
+    assert_eq!(infos[0].model_number, 1);
+    assert_eq!(infos[1].model_number, 3);
+    assert!(infos[0].header_value().contains("fbb127bbb056c959"));
+    let resolved = client.resolve_model("flash").expect("mock resolve flash");
+    assert_eq!(resolved.name, "gemini-flash");
 
     let chats = client.list_chats(10).expect("mock chats");
     assert_eq!(chats[0].0, "c_chat1");

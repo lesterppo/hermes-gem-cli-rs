@@ -108,23 +108,24 @@ Legend: ✅ Implemented · ◐ Partial · ⏳ Not yet (reason given, never faked
 | Direct chat, Gem chat | ✅ | StreamGenerate, 81-slot request, pointer JSON |
 | Multi-turn `-c sess.json`, `--new`, `--clear` | ✅ | Same JSON state file (`metadata`/`cid`/`turns`) |
 | `--resume <cid>` | ◐ | Creates state with the cid; metadata is not refetched from history |
-| `--list-models` | ◐ | Via GET_USER_STATUS RPC; model names best-effort (library builds full AvailableModel objects with headers — the Rust chat path uses the default model unless a model header is supplied by that RPC; `-m` labels the pointer, it does not yet select a model header) |
+| `--list-models` | ✅ | GET_USER_STATUS parsed as gemini-webapi AvailableModel (name/alias/header); live `["gemini-自動"]` == Python |
+| `-m/--model`, `--thinking` | ✅ | Registry resolution + model header + slot 79; unknown names fail listing available models, as Python does |
 | `--list-gems`, `--gem-info` | ✅ | Browser-shaped LIST_BOTS, system + custom |
-| `--create-gem`, `--delete-gem` | ✅ | oMH3Zd / UXcSJb payloads from the Python fallback |
+| `--create-gem`, `--delete-gem` | ✅ | oMH3Zd / UXcSJb, live-verified 2026-10-26 |
 | `--list-chats`, `--read-chat`, `--fetch-latest` | ✅ | MaZiqc / hNvQHb, oldest-first turns |
-| `--deep-research`, `--deep-research-status` | ◐ | Chat path sends the deep-research StreamGenerate flags; status is a heuristic (report present in chat vs in progress) — the Python original uses plan/start/wait RPCs, which are not yet reimplemented |
+| `--deep-research`, `--deep-research-status` | ✅ / ◐ | Full Python flow (plan turn, confirm turn, poll for the report); status remains a heuristic (report present in chat vs in progress) |
 | `--img`, `--img-gen` | ✅ | Via the chat path (`Generate an image: …`); generated-image URLs parsed from rich content |
 | `--extract-code`, `--extract-canvas` | ✅ | Code blocks / HTML artifact from response text |
 | `--save-videos`, `--save-media` | ✅ | Downloads parsed media URLs (unverified live) |
 | `--temporary`, `--show-thoughts`, `--brief`, `--raw`, `--quiet`, `--json-out`, `--no-retry`, `-t` | ✅ | |
-| `--stream` | ◐ | Accepted; the blocking client reads the full response, so output is emitted at the end, not as live deltas |
+| `--stream` | ✅ | Real streaming via leyline decoded body stream, text-delta emission (Rust-only flag; Python gem-cli.py has no --stream) |
 | `--timeout-soft` | ◐ | Accepted for CLI compatibility; the hard `-t` timeout governs |
-| `--doctor`, `--init` | ◐ | Doctor reports existence/liveness only, never values; `--init` validates and caches the current env/auth.json/Chromium session. Python's `--init` also scans Firefox via browser_cookie3 — the Rust port does not scan Firefox (see below) |
-| Firefox cookie scan (browser tier) | ⏳ | Python's tier 3 scans Firefox → Chrome → Edge → Safari via browser_cookie3; the Rust port scans Chromium profiles only |
-| `-f/--file`, `-i/--image` upload | ⏳ | Content-push upload path not reimplemented; returns `UPLOAD_NOT_YET` |
-| `--login` (browser flow) | ⏳ | Needs a browser; sign in manually, then `--init` |
-| `--edit-gem`, `--delete-chat` | ⏳ | UPDATE_BOT_METADATA / DELETE_CONVERSATION payloads not verified against a live session; returns `NOT_YET` |
-| CDP cookie tier (`GEMINI_CDP_URL`) | ⏳ | Python reads cookies from a running CDP browser via Playwright; the Rust port does not (env / auth.json / Chromium tiers only) |
+| `--doctor`, `--init` | ✅ | Doctor reports existence/liveness only, never values; `--init` validates and caches the current session from env/auth.json/Chromium/Firefox/Edge |
+| Firefox / Edge cookie scan (browser tier) | ✅ | Firefox plaintext sqlite + Edge Chromium profile; `--browser` / `GEMINI_BROWSER` orders the scan (Python order: chrome, firefox, edge; Safari has no Linux store) |
+| `-f/--file`, `-i/--image` upload | ✅ | Content-push multipart + StreamGenerate file_data; live-verified with a text file (BANANA) and a PNG (lighthouse description) |
+| `--login` (browser flow) | ◐ | Implemented (xdg-open + 120s cookie-scan poll); not live-tested end-to-end — it needs a person signing in |
+| `--edit-gem`, `--delete-chat` | ✅ | UPDATE_BOT_METADATA / DELETE_CONVERSATION, live-verified 2026-10-26 (delete-chat removes from history; turns stay readable, exactly as Python) |
+| CDP cookie tier (`GEMINI_CDP_URL`) | ✅ | /json/version + WebSocket Network.getAllCookies via tokio-tungstenite, after local browsers (Python gemini.py ordering); GEMINI_NO_CDP disables it |
 | Chromium GCM cookies without a Local State key | ⏳ | Decryption needs the profile's key (keyring); when unavailable the tier yields nothing and auth falls through to re-sign-in |
 
 ## Live-test status (2026-10-26)
@@ -151,11 +152,17 @@ list-models, list-chats, create/delete Gem) and the offline paths
 authenticated commands without a session, `BAD_URL`/`NO_PROMPT`).
 Mock outputs are never presented as live results.
 
-**To unblock live testing:** sign in at gemini.google.com in a browser
-on a machine where the session lives, then either set
-`GEMINI_SID`/`GEMINI_TS` for the run or run `gem-cli-rs --init` after
-the browser session is available to this VM. Do not paste raw cookie
-values into chat.
+**Live test update (2026-10-26 evening):** the full binary now runs
+live — transport is leyline-http (Chrome 154 profile; plain
+reqwest/rustls could not reach gemini.google.com from this VM), and
+a StreamGenerate slot-41 bug (`1` → `[1]`) found live is fixed.
+`--doctor` reports `live_available:true`, Storybook chat and its
+same-conversation follow-up match the Python original (Paris /
+Seine). Full numbers in DEEP_TEST.md. To run live yourself: sign in
+at gemini.google.com in a browser on a machine where the session
+lives, then either set `GEMINI_SID`/`GEMINI_TS` for the run or run
+`gem-cli-rs --init` after the browser session is available to this
+VM. Do not paste raw cookie values into chat.
 
 ## Testing
 

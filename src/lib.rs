@@ -22,8 +22,8 @@ pub mod client;
 pub mod protocol;
 pub mod util;
 
-pub use auth::{Auth, AuthCandidate, resolve_auth, validate_auth};
-pub use client::{ChatResult, GeminiClient, Gem};
+pub use auth::{auth_cache_path, scan_browsers, Auth, AuthCandidate, resolve_auth, validate_auth};
+pub use client::{ChatResult, GeminiClient, Gem, ModelInfo};
 pub use protocol::{
     build_stream_request, default_metadata, extract_gem_id, extract_tokens,
     parse_batchexecute, parse_stream_response, BatchexecuteTokens,

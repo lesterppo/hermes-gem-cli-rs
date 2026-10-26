@@ -96,9 +96,12 @@ pub fn build_stream_request(
     deep_research: bool,
     extended_thinking: bool,
     model_number: Option<i64>,
+    file_data: Option<Value>,
 ) -> Value {
     let mut req: Vec<Value> = vec![Value::Null; 81];
-    req[0] = json!([prompt, 0, null, null, null, null, 0]);
+    // Python message_content: [prompt, 0, None, req_file_data, None, None, 0]
+    // where req_file_data = [[[uploaded_url], filename], ...] per file.
+    req[0] = json!([prompt, 0, null, file_data, null, null, 0]);
     req[1] = json!([language]);
     req[2] = metadata.clone();
     if deep_research {
@@ -119,7 +122,7 @@ pub fn build_stream_request(
     }
     req[27] = json!(1);
     req[30] = json!([4]);
-    req[41] = json!(1);
+    req[41] = json!([1]);
     if temporary {
         req[45] = json!(1);
     }
@@ -151,11 +154,14 @@ pub fn batchexecute_form(
         Value::String("generic".to_string()),
     ];
     let freq = serde_json::to_string(&vec![vec![inner]]).unwrap_or_default();
+    // Python uses the session language (TuX5cc) for hl, not a hardcoded
+    // "en": model/gem names localise with it (this account: Chinese).
+    let hl = tokens.language.clone().unwrap_or_else(|| "en".to_string());
     vec![
         ("rpcids".into(), rpcid.into()),
         ("source-path".into(), "/app".into()),
         ("bl".into(), tokens.bl.clone().unwrap_or_default()),
-        ("hl".into(), "en".into()),
+        ("hl".into(), hl),
         ("f.req".into(), freq),
         ("at".into(), tokens.at.clone().unwrap_or_default()),
     ]
@@ -409,11 +415,13 @@ mod tests {
             false,
             true,
             None,
+            None,
         );
         let arr = req.as_array().unwrap();
         assert_eq!(arr.len(), 81);
         assert_eq!(arr[0][0], "hi");
         assert_eq!(arr[7], 1);
+        assert_eq!(arr[41], json!([1]));
         assert_eq!(arr[19], "GEM1");
         assert_eq!(arr[80], 2);
         assert_eq!(arr[30], json!([4]));
