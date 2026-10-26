@@ -1,0 +1,5 @@
+/target/
+auth.json
+*.json.bak
+sess.json
+*.log
